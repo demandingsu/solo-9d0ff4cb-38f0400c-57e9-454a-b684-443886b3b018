@@ -206,12 +206,16 @@ def query_publications(
     probe_id: Optional[str] = None,
     day: Optional[str] = None,
     include_history: bool = False,
+    include_evidence: bool = False,
 ) -> dict:
     """List the current publication of each (probe, day).
 
     Defaults to the latest row per pair (serving or stale — a stale row is
     still the queryable old version until a successful recompute replaces it).
-    With ``include_history=true`` every version row is returned.
+    With ``include_history=true`` every version row is returned. Each item
+    carries ``evidence_available``; ``include_evidence=true`` additionally
+    embeds the retained computation basis (readings/certificates/minutes)
+    of every returned version.
     """
     conn = db.connect()
     try:
@@ -230,7 +234,7 @@ def query_publications(
                 "ORDER BY probe_id, day, id",
                 params,
             ).fetchall()
-            items = [_publication_item(r) for r in rows]
+            items = [_publication_item(r, include_evidence) for r in rows]
         else:
             # Latest row per (probe, day): its status is serving or stale.
             rows = conn.execute(
@@ -240,16 +244,16 @@ def query_publications(
                 ") g ON p.id = g.max_id ORDER BY p.probe_id, p.day",
                 params,
             ).fetchall()
-            items = [_publication_item(r) for r in rows]
+            items = [_publication_item(r, include_evidence) for r in rows]
 
         return {"count": len(items), "publications": items}
     finally:
         conn.close()
 
 
-def _publication_item(row) -> dict:
+def _publication_item(row, include_evidence: bool = False) -> dict:
     payload = json.loads(row["payload"])
-    return {
+    item = {
         "publication_id": row["id"],
         "probe_id": row["probe_id"],
         "day": row["day"],
@@ -257,13 +261,40 @@ def _publication_item(row) -> dict:
         "data_version": row["data_version"],
         "status": row["status"],
         "created_at": row["created_at"],
+        "evidence_available": row["evidence"] is not None,
         "payload": payload,
     }
+    if include_evidence:
+        item["evidence"] = (
+            json.loads(row["evidence"]) if row["evidence"] is not None else None
+        )
+    return item
+
+
+@app.get("/api/publications/compare")
+def compare_publication_versions(
+    probe_id: str, day: str, from_id: int, to_id: int
+) -> dict:
+    """Minute-by-minute diff of two versions of the same probe / UTC day.
+
+    Reports raw temperature, applicable offset, calibrated value and
+    over-threshold status per minute for both versions, marks the changed
+    periods and classifies each change as a reading change, a certificate
+    change or both. Versions without retained evidence (published before
+    difference tracing existed) make the comparison untraceable — their
+    basis is never back-filled with current values.
+    """
+    return services.compare_publications(probe_id, parse_day(day), from_id, to_id)
 
 
 @app.get("/api/publications/{probe_id}/{day}")
-def get_publication(probe_id: str, day: str, include_history: bool = False) -> dict:
-    result = query_publications(probe_id, day, include_history)
+def get_publication(
+    probe_id: str,
+    day: str,
+    include_history: bool = False,
+    include_evidence: bool = False,
+) -> dict:
+    result = query_publications(probe_id, day, include_history, include_evidence)
     if not result["publications"]:
         return JSONResponse(
             status_code=404,

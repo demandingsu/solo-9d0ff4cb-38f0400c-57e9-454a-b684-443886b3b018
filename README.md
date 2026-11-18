@@ -2,7 +2,9 @@
 
 面向冷链质控/追溯场景的小型服务：导入探头原始读数、维护校准证书（半开、互不重叠
 的有效期与温度偏移），按 **探头 × UTC 日** 发布“校准后高于 8 ℃ 的连续分钟时段”，
-并在数据或证书变更后维护发布版本的**过期 / 供数**状态。
+在数据或证书变更后维护发布版本的**过期 / 供数**状态，并为每次发布留存**计算依据**
+（当时的读数、证书与逐分钟结果），支持同探头同 UTC 日任意两个版本的**逐分钟差异
+追溯**（区分读数变化 / 证书变化 / 两者共同变化）。
 
 技术栈：FastAPI + SQLite（WAL）+ 原生 HTML/JS 单页界面，Docker Compose 一键启动。
 
@@ -86,6 +88,29 @@ CAL_DB_PATH=data/calibration.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 > 该日即标记过期（即使实际覆盖分钟未变）。这保证“后补证书改变历史判断”一定
 > 可见；重算后内容未变也只会得到一份新的 serving 版本，不影响正确性。
 
+### 2.5 发布依据留存与版本差异追溯
+
+- **依据随版本留存**：每次发布成功时，把当时参与计算的**读数清单、证书清单
+  和逐分钟结果**（原始温度、适用偏移、校准温度、是否超温）作为 `evidence`
+  与发布结果写入**同一事务、同一行**。证据与发布结果必然取自同一已提交快照。
+- **依据不可改写**：后续导入（含更正替换）或证书新增/修改/删除只会把受影响
+  版本置为 `stale`，**绝不改写**任何已发布版本的 payload 与 evidence。
+- **失败不留痕**：重算失败整笔回滚——不产生新版本、不留下新证据，旧版
+  （含 stale 旧版）及其依据原样可查。
+- **版本对比**：`GET /api/publications/compare?probe_id=&day=&from_id=&to_id=`
+  对同探头同 UTC 日的两个版本做逐分钟对照，返回：
+  - 每分钟的两侧原始温度 / 适用偏移 / 校准温度 / 超温状态；
+  - 每分钟的变化分类：`reading`（读数变化，含该分钟读数新增/消失）、
+    `certificate`（适用偏移变化，含证书断档出现/消失）、`both`（两者共同）；
+  - `changed_periods`：相邻同类型变化分钟合并出的半开时段清单；
+  - `summary`：各类变化分钟数与超温状态翻转数。
+- **无依据的历史版**：在依据留存功能启用前发布的版本（`evidence` 为 NULL，
+  列表中 `evidence_available=false`）**仍可正常查询**；与任何版本对比时返回
+  `traceable=false` 并明确说明**无法追因**，服务**不会**用当前读数/证书现值
+  去填补缺失的历史依据。
+- 旧库升级：`init_db` 会为既有 `publications` 表补齐 `evidence` 列
+  （`ALTER TABLE`），历史行该列为 NULL，即上述“无依据的历史版”。
+
 ---
 
 ## 3. HTTP 接口摘要
@@ -100,7 +125,8 @@ CAL_DB_PATH=data/calibration.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | DELETE | `/api/certificates/{id}` | 删除证书 |
 | POST | `/api/publications` | 发布/重算单日 `{probe_id, day}` |
 | POST | `/api/publications/recompute-all` | 重算所有有读数的探头×日（逐日独立事务） |
-| GET  | `/api/publications?probe_id=&day=&include_history=` | 查询当前版本（默认）或全部历史 |
+| GET  | `/api/publications?probe_id=&day=&include_history=&include_evidence=` | 查询当前版本（默认）或全部历史；`include_evidence=true` 时附各版本留存依据 |
+| GET  | `/api/publications/compare?probe_id=&day=&from_id=&to_id=` | 两版本逐分钟差异对照（读数/证书/两者共同分类） |
 | GET  | `/api/publications/{probe_id}/{day}` | 单组查询，无版本返回 404 |
 | GET  | `/health` | 健康检查与当前 data_version |
 
@@ -123,6 +149,11 @@ curl -X POST http://localhost:8000/api/publications -H 'Content-Type: applicatio
 
 # 4) 查询（过期旧版同样返回，status=stale）
 curl "http://localhost:8000/api/publications?probe_id=P-01&day=2024-01-01"
+
+# 5) 更正读数后重算，再对比新旧两个版本（差异追溯）
+curl -X POST http://localhost:8000/api/publications -H 'Content-Type: application/json' \
+  -d '{"probe_id":"P-01","day":"2024-01-01"}'
+curl "http://localhost:8000/api/publications/compare?probe_id=P-01&day=2024-01-01&from_id=1&to_id=2"
 ```
 
 CSV 示例：
@@ -138,13 +169,18 @@ P-01,2024-01-01T00:02Z,9.1
 
 ## 4. 网页界面
 
-访问根路径 `/`（自动跳转到 `/static/index.html`），四个操作区：
+访问根路径 `/`（自动跳转到 `/static/index.html`），五个操作区：
 
 1. **读数导入**：选择 CSV 文件或直接粘贴文本；展示插入/替换数与被置过期的日期；
 2. **校准证书**：表单新增，列表内可改（有效期/偏移）、可删，重叠时提示且不落库；
 3. **发布**：按探头 + UTC 日发布/重算，或一键全部重算；
 4. **版本查询**：表格展示每个发布版本的状态徽章（供数中/已过期/被替代）、
-   超温时段明细和“有读数却未校准”的分钟清单，可勾选查看全部历史版本。
+   是否留存计算依据（依据✓/无依据）、超温时段明细和“有读数却未校准”的分钟
+   清单，可勾选查看全部历史版本；
+5. **版本对比（差异追溯）**：输入探头与 UTC 日后加载全部版本，选取基线/对比
+   两个版本，展示变化分钟统计、按类型合并的变化时段，以及逐分钟对照表
+   （两侧原始温度、适用偏移、校准温度、超温状态，变化单元格高亮，可只看变化
+   分钟）；涉及无依据历史版时明确提示无法追因。
 
 页头实时显示当前 `data_version`。
 
@@ -157,13 +193,17 @@ pip install -r requirements-dev.txt   # 含 pytest/httpx
 python -m pytest tests/ -q
 ```
 
-测试覆盖（共 30 个用例）：
+测试覆盖（共 46 个用例）：
 
 - 纯计算引擎：缺分钟/断档截断、半开证书边界、严格 >8 ℃、峰值统计、负偏移；
 - 导入：插入→更正替换、文件内重复折叠、ISO/整数时间、坏文件整笔回滚；
 - 证书：重叠 409、端点相接、非法半开区间、修改/删除/404；
 - 发布生命周期：serving →（更正/补证）→ stale → 重算 serving、历史 superseded、
   无读数 404、注入重算失败后 stale 旧版仍在；
+- 差异追溯：发布即留存读数/证书/逐分钟结果、后续导入与改证不改写旧版依据、
+  读数变化/证书变化/两者共同/新增分钟/证书断档的分类与变化时段合并、
+  无依据历史版可查询但对比明确无法追因且不用现值填补、
+  重算失败不留新证据、证据与发布结果取自同一已提交快照；
 - 交错一致性：失败导入/失败改证不改状态、镜像状态逐版比对发布内容、
   4 线程并发（导入×15、改证×10、发布×12、坏导入×10）后所有不变量成立；
 - 边界：UTC 日界切分、多探头独立过期、按日过滤、ISO 渲染。

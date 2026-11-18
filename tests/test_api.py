@@ -303,22 +303,23 @@ def test_recompute_failure_keeps_stale_old_version(service_db, monkeypatch):
     def boom(*_a, **_kw):
         raise services.ComputeError("injected failure")
 
-    monkeypatch.setattr(services, "compute_day", boom)
+    monkeypatch.setattr(services, "compute_day_with_trace", boom)
     try:
         services.publish_day("P-01", BASE // 1440)
         raise AssertionError("publish should have failed")
     except services.ServiceError as e:
         assert e.status_code == 500
 
-    # no new row; stale old version still queryable
+    # no new row; stale old version still queryable, its evidence untouched
     import sqlite3
 
     conn = sqlite3.connect(service_db.get_db_path())
     rows = conn.execute(
-        "SELECT id, status, data_version FROM publications"
+        "SELECT id, status, data_version, evidence FROM publications"
     ).fetchall()
     conn.close()
     assert len(rows) == 1 and rows[0][1] == "stale"
+    assert rows[0][3] is not None  # retained basis of the old version survives
 
 
 def test_recompute_all_reports_per_day_results(client):

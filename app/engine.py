@@ -49,6 +49,34 @@ def compute_day(
     readings: list[Reading],
     calibrations: list[Calibration],
 ) -> dict:
+    """Compute the publication payload for one probe / UTC day."""
+    payload, _trace = _compute(probe_id, day, readings, calibrations)
+    return payload
+
+
+def compute_day_with_trace(
+    probe_id: str,
+    day: int,
+    readings: list[Reading],
+    calibrations: list[Calibration],
+) -> tuple[dict, list[dict]]:
+    """Return ``(payload, minute_trace)`` computed from one snapshot.
+
+    The trace is the per-minute evidence retained with each publication:
+    for every minute that has a reading it records the raw value, the
+    certificate offset applied (``None`` on a certificate gap), the
+    calibrated value and the over-threshold judgment, exactly as computed
+    from the same committed snapshot that produced the payload.
+    """
+    return _compute(probe_id, day, readings, calibrations)
+
+
+def _compute(
+    probe_id: str,
+    day: int,
+    readings: list[Reading],
+    calibrations: list[Calibration],
+) -> tuple[dict, list[dict]]:
     """Compute the publication payload for one probe / UTC day.
 
     Rules implemented:
@@ -84,12 +112,33 @@ def compute_day(
 
     uncalibrated: list[int] = []
     calibrated: list[tuple[int, float]] = []
+    trace: list[dict] = []
     for minute in minutes:
         offset = find_offset(ordered, minute)
         if offset is None:
             uncalibrated.append(minute)
+            trace.append(
+                {
+                    "minute_utc": minute,
+                    "raw_c": by_minute[minute],
+                    "offset_c": None,
+                    "calibrated_c": None,
+                    "above_threshold": None,
+                }
+            )
         else:
-            calibrated.append((minute, by_minute[minute] + offset))
+            value = by_minute[minute] + offset
+            calibrated.append((minute, value))
+            trace.append(
+                {
+                    "minute_utc": minute,
+                    "raw_c": by_minute[minute],
+                    "offset_c": float(offset),
+                    "calibrated_c": _round3(value),
+                    # judgment uses the full-precision value (strictly > 8 C)
+                    "above_threshold": value > THRESHOLD_C,
+                }
+            )
 
     segments: list[dict] = []
     run: list[tuple[int, float]] = []
@@ -136,4 +185,140 @@ def compute_day(
         "uncalibrated_minutes": uncalibrated,
         "uncalibrated_minutes_utc": [minute_to_iso(m) for m in uncalibrated],
         "segments": segments,
+    }, trace
+
+
+# --------------------------------------------------------------------------- #
+# Version-to-version difference tracing
+# --------------------------------------------------------------------------- #
+#: change_type values used by :func:`diff_traces`
+CHANGE_NONE = "none"
+CHANGE_READING = "reading"          # raw reading changed (incl. appeared/removed)
+CHANGE_CERTIFICATE = "certificate"  # applicable certificate offset changed
+CHANGE_BOTH = "both"                # reading and certificate changed together
+
+_TOL = 1e-9
+
+
+def _num_eq(a, b) -> bool:
+    """None-aware numeric equality with a small float tolerance."""
+    if a is None or b is None:
+        return a is None and b is None
+    return abs(float(a) - float(b)) <= _TOL
+
+
+def _side(row: dict | None) -> dict | None:
+    """One version's per-minute view; ``None`` means no reading that minute."""
+    if row is None:
+        return None
+    return {
+        "raw_c": row["raw_c"],
+        "offset_c": row["offset_c"],
+        "calibrated_c": row["calibrated_c"],
+        "above_threshold": row["above_threshold"],
+    }
+
+
+def diff_traces(trace_from: list[dict], trace_to: list[dict]) -> dict:
+    """Minute-by-minute diff of two retained evidence traces.
+
+    Both traces must come from publications of the same probe / UTC day.
+    For every minute present in either trace the diff reports both sides
+    (raw / offset / calibrated / over-threshold) and classifies the change
+    as ``reading`` (raw value changed, incl. a reading appearing or
+    disappearing), ``certificate`` (the applicable offset changed) or
+    ``both``. A certificate change is only attributed when both versions
+    have a reading at that minute — a missing reading is itself the
+    reading change. Consecutive changed minutes of one type are merged
+    into half-open ``changed_periods``.
+    """
+    by_from = {r["minute_utc"]: r for r in trace_from}
+    by_to = {r["minute_utc"]: r for r in trace_to}
+
+    minutes: list[dict] = []
+    for minute in sorted(set(by_from) | set(by_to)):
+        a = by_from.get(minute)
+        b = by_to.get(minute)
+        reading_changed = (a is None) != (b is None) or (
+            a is not None
+            and b is not None
+            and not _num_eq(a["raw_c"], b["raw_c"])
+        )
+        certificate_changed = (
+            a is not None
+            and b is not None
+            and not _num_eq(a["offset_c"], b["offset_c"])
+        )
+        if reading_changed and certificate_changed:
+            change_type = CHANGE_BOTH
+        elif reading_changed:
+            change_type = CHANGE_READING
+        elif certificate_changed:
+            change_type = CHANGE_CERTIFICATE
+        else:
+            change_type = CHANGE_NONE
+
+        above_a = a["above_threshold"] if a else None
+        above_b = b["above_threshold"] if b else None
+        cal_a = a["calibrated_c"] if a else None
+        cal_b = b["calibrated_c"] if b else None
+        minutes.append(
+            {
+                "minute_utc": minute,
+                "minute_iso": minute_to_iso(minute),
+                "from": _side(a),
+                "to": _side(b),
+                "reading_changed": reading_changed,
+                "certificate_changed": certificate_changed,
+                "calibrated_changed": not _num_eq(cal_a, cal_b),
+                "status_changed": above_a != above_b,
+                "change_type": change_type,
+            }
+        )
+
+    # Merge consecutive changed minutes of one type into half-open periods.
+    changed_periods: list[dict] = []
+    current: dict | None = None
+    for row in minutes:
+        if row["change_type"] == CHANGE_NONE:
+            continue
+        if (
+            current is not None
+            and current["change_type"] == row["change_type"]
+            and row["minute_utc"] == current["end_minute"]
+        ):
+            current["end_minute"] += 1
+            current["minutes"] += 1
+            continue
+        if current is not None:
+            changed_periods.append(current)
+        current = {
+            "change_type": row["change_type"],
+            "start_minute": row["minute_utc"],
+            "end_minute": row["minute_utc"] + 1,
+            "minutes": 1,
+        }
+    if current is not None:
+        changed_periods.append(current)
+    for period in changed_periods:
+        period["start_utc"] = minute_to_iso(period["start_minute"])
+        period["end_utc"] = minute_to_iso(period["end_minute"])
+        period["duration_minutes"] = period["end_minute"] - period["start_minute"]
+
+    summary = {
+        "minutes_compared": len(minutes),
+        "minutes_changed": sum(1 for r in minutes if r["change_type"] != CHANGE_NONE),
+        "reading_changes": sum(
+            1 for r in minutes if r["change_type"] == CHANGE_READING
+        ),
+        "certificate_changes": sum(
+            1 for r in minutes if r["change_type"] == CHANGE_CERTIFICATE
+        ),
+        "both_changes": sum(1 for r in minutes if r["change_type"] == CHANGE_BOTH),
+        "status_changes": sum(1 for r in minutes if r["status_changed"]),
+    }
+    return {
+        "summary": summary,
+        "changed_periods": changed_periods,
+        "minutes": minutes,
     }

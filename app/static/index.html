@@ -43,6 +43,17 @@
   .badge.serving { background: #dcfce7; color: var(--green); }
   .badge.stale { background: #fee2e2; color: var(--red); }
   .badge.superseded { background: #fef3c7; color: var(--amber); }
+  .badge.reading { background: #dbeafe; color: #1d4ed8; }
+  .badge.certificate { background: #fef3c7; color: var(--amber); }
+  .badge.both { background: #fee2e2; color: var(--red); }
+  .badge.none { background: #e2e8f0; color: var(--muted); }
+  tr.changed td { background: #fff7ed; }
+  td.cell-chg { color: var(--red); font-weight: 600; }
+  .warn { background: #fffbeb; border: 1px solid #f59e0b; border-radius: 8px;
+          padding: 10px 12px; font-size: 13px; color: #92400e; margin-top: 10px; }
+  .chips { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0; }
+  .chip { background: #f1f5f9; border-radius: 999px; padding: 4px 12px; font-size: 12.5px; }
+  .chip b { color: var(--blue); }
   pre.out { background: #0f172a; color: #d1fae5; padding: 10px; border-radius: 8px;
             font-size: 12px; overflow: auto; max-height: 260px; margin: 10px 0 0; }
   .hint { font-size: 12px; color: var(--muted); margin-top: 6px; line-height: 1.5; }
@@ -124,6 +135,29 @@ P-01,28801,8.6"></textarea>
       <div style="flex:0"><button id="btnQuery">查询</button></div>
     </div>
     <div id="pubTable"></div>
+  </section>
+
+  <!-- 5. 版本对比（差异追溯） -->
+  <section class="card wide">
+    <h2>5. 版本对比（差异追溯）<span class="tag">同探头同 UTC 日 · 逐分钟对照原始温度 / 适用偏移 / 校准温度 / 超温状态</span></h2>
+    <div class="filters">
+      <div><label>探头号</label><input id="cmpProbe" placeholder="P-01" /></div>
+      <div><label>UTC 日</label><input id="cmpDay" placeholder="2024-01-01" /></div>
+      <div style="flex:0"><button id="btnLoadVersions">加载版本</button></div>
+    </div>
+    <div class="row">
+      <div><label>基线版本（旧）</label><select id="cmpFrom"></select></div>
+      <div><label>对比版本（新）</label><select id="cmpTo"></select></div>
+      <div style="flex:0"><button id="btnCompare">开始对比</button></div>
+    </div>
+    <div class="checkbox" style="margin-top:8px">
+      <input type="checkbox" id="cmpOnlyChanged" checked />
+      <label for="cmpOnlyChanged" style="margin:0">仅显示发生变化的分钟</label>
+    </div>
+    <div class="hint">每次发布都留存了当时参与计算的读数、证书与逐分钟结果；变化按
+      <b>读数变化</b> / <b>证书变化</b> / <b>两者共同</b> 分类。启用追溯前发布的历史版本没有留存依据，
+      对比时会明确提示“无法追因”，不会用当前读数/证书 现值填补。</div>
+    <div id="cmpResult"></div>
   </section>
 </main>
 
@@ -274,7 +308,8 @@ function renderPublications(items) {
       : '<span class="muted">全部读数均在证书有效期内</span>';
     return `<tr>
       <td>${it.publication_id}<br><span class="badge ${it.status}">${
-          {serving: "供数中", stale: "已过期", superseded: "被替代"}[it.status]}</span></td>
+          {serving: "供数中", stale: "已过期", superseded: "被替代"}[it.status]}</span><br>
+          <span class="muted">${it.evidence_available ? "依据✓" : "无依据"}</span></td>
       <td>${it.probe_id}</td><td>${it.day_utc}</td><td>v${it.data_version}</td>
       <td>读数 ${p.total_reading_minutes} 分钟 / 已校准 ${p.calibrated_minutes} 分钟</td>
       <td>${segs}${uncal}</td>
@@ -285,6 +320,116 @@ function renderPublications(items) {
 }
 
 refreshMeta();
+
+// ---------- 5. 版本对比（差异追溯） ----------
+const STATUS_TEXT = {serving: "供数中", stale: "已过期", superseded: "被替代"};
+const CHANGE_TEXT = {reading: "读数变化", certificate: "证书变化", both: "两者共同", none: "无变化"};
+let cmpVersions = [];
+let cmpLast = null;
+
+$("btnLoadVersions").onclick = async () => {
+  const probe = $("cmpProbe").value.trim(), day = $("cmpDay").value.trim();
+  if (!probe || !day) { $("cmpResult").innerHTML = '<p class="err">请填写探头号与 UTC 日</p>'; return; }
+  try {
+    const p = new URLSearchParams({probe_id: probe, day, include_history: "true"});
+    const r = await call("/api/publications?" + p.toString());
+    cmpVersions = r.publications;
+    if (!cmpVersions.length) {
+      $("cmpResult").innerHTML = '<p class="muted">该探头在该日没有已发布版本</p>';
+      $("cmpFrom").innerHTML = $("cmpTo").innerHTML = "";
+      return;
+    }
+    const opts = cmpVersions.map(v =>
+      `<option value="${v.publication_id}">#${v.publication_id} · ${STATUS_TEXT[v.status]} · v${v.data_version} · ${v.created_at}${v.evidence_available ? "" : " · 无依据"}</option>`
+    ).join("");
+    $("cmpFrom").innerHTML = opts;
+    $("cmpTo").innerHTML = opts;
+    // sensible defaults: oldest as baseline, newest as comparison
+    $("cmpFrom").value = cmpVersions[0].publication_id;
+    $("cmpTo").value = cmpVersions[cmpVersions.length - 1].publication_id;
+    $("cmpResult").innerHTML = `<p class="muted">已加载 ${cmpVersions.length} 个版本，请选择两个版本对比</p>`;
+  } catch (e) { $("cmpResult").innerHTML = '<p class="err">加载失败: ' + e.message + "</p>"; }
+};
+
+$("btnCompare").onclick = async () => {
+  const from = $("cmpFrom").value, to = $("cmpTo").value;
+  if (!from || !to) { $("cmpResult").innerHTML = '<p class="err">请先加载并选择两个版本</p>'; return; }
+  try {
+    const p = new URLSearchParams({
+      probe_id: $("cmpProbe").value.trim(), day: $("cmpDay").value.trim(),
+      from_id: from, to_id: to
+    });
+    cmpLast = await call("/api/publications/compare?" + p.toString());
+    renderCompare();
+  } catch (e) { cmpLast = null; $("cmpResult").innerHTML = '<p class="err">对比失败: ' + e.message + "</p>"; }
+};
+$("cmpOnlyChanged").onchange = () => { if (cmpLast) renderCompare(); };
+
+function sideCell(side, key, changed) {
+  if (!side) return "<td>—</td>";
+  const v = side[key];
+  const text = v === null || v === undefined ? "—"
+    : key === "above_threshold" ? (v ? "超温" : "正常")
+    : v;
+  return `<td class="${changed ? "cell-chg" : ""}">${text}</td>`;
+}
+
+function renderCompare() {
+  const r = cmpLast;
+  const head = `<p>探头 <b>${r.probe_id}</b> · UTC 日 <b>${r.day_utc}</b>：
+    版本 <b>#${r.from.publication_id}</b>（${STATUS_TEXT[r.from.status]}，v${r.from.data_version}）
+    → 版本 <b>#${r.to.publication_id}</b>（${STATUS_TEXT[r.to.status]}，v${r.to.data_version}）</p>`;
+
+  if (!r.traceable) {
+    $("cmpResult").innerHTML = head +
+      `<div class="warn">⚠ ${r.reason}</div>`;
+    return;
+  }
+
+  const s = r.summary;
+  const chips = `<div class="chips">
+    <span class="chip">对比分钟 <b>${s.minutes_compared}</b></span>
+    <span class="chip">变化分钟 <b>${s.minutes_changed}</b></span>
+    <span class="chip">读数变化 <b>${s.reading_changes}</b></span>
+    <span class="chip">证书变化 <b>${s.certificate_changes}</b></span>
+    <span class="chip">两者共同 <b>${s.both_changes}</b></span>
+    <span class="chip">超温状态翻转 <b>${s.status_changes}</b></span>
+  </div>`;
+
+  const periods = r.changed_periods.length
+    ? "<h3 style='font-size:13px;margin:10px 0 4px'>发生变化的时段</h3><table>" +
+      "<tr><th>起 UTC</th><th>止 UTC（不含）</th><th>分钟数</th><th>变化类型</th></tr>" +
+      r.changed_periods.map(p => `<tr>
+        <td class="mono">${p.start_utc}</td><td class="mono">${p.end_utc}</td>
+        <td>${p.duration_minutes}</td>
+        <td><span class="badge ${p.change_type}">${CHANGE_TEXT[p.change_type]}</span></td>
+      </tr>`).join("") + "</table>"
+    : '<p class="muted">两个版本的逐分钟结果完全一致</p>';
+
+  const onlyChanged = $("cmpOnlyChanged").checked;
+  const rows = r.minutes.filter(m => !onlyChanged || m.change_type !== "none");
+  const minuteTable = rows.length
+    ? "<h3 style='font-size:13px;margin:12px 0 4px'>逐分钟对照（旧版 → 新版）</h3><table>" +
+      "<tr><th rowspan=2>分钟 UTC</th><th colspan=4>基线版本 #" + r.from.publication_id + "</th>" +
+      "<th colspan=4>对比版本 #" + r.to.publication_id + "</th><th rowspan=2>变化类型</th></tr>" +
+      "<tr><th>原始℃</th><th>偏移℃</th><th>校准℃</th><th>状态</th>" +
+      "<th>原始℃</th><th>偏移℃</th><th>校准℃</th><th>状态</th></tr>" +
+      rows.map(m => `<tr class="${m.change_type !== "none" ? "changed" : ""}">
+        <td class="mono">${m.minute_iso}</td>
+        ${sideCell(m.from, "raw_c", m.reading_changed)}
+        ${sideCell(m.from, "offset_c", m.certificate_changed)}
+        ${sideCell(m.from, "calibrated_c", m.calibrated_changed)}
+        ${sideCell(m.from, "above_threshold", m.status_changed)}
+        ${sideCell(m.to, "raw_c", m.reading_changed)}
+        ${sideCell(m.to, "offset_c", m.certificate_changed)}
+        ${sideCell(m.to, "calibrated_c", m.calibrated_changed)}
+        ${sideCell(m.to, "above_threshold", m.status_changed)}
+        <td><span class="badge ${m.change_type}">${CHANGE_TEXT[m.change_type]}</span></td>
+      </tr>`).join("") + "</table>"
+    : '<p class="muted">没有符合条件的分钟（可取消“仅显示发生变化的分钟”查看全部）</p>';
+
+  $("cmpResult").innerHTML = head + chips + periods + minuteTable;
+}
 </script>
 </body>
 </html>

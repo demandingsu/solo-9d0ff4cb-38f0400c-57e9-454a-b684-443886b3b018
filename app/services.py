@@ -12,7 +12,14 @@ import io
 import json
 
 from . import db
-from .engine import Calibration, ComputeError, Reading, compute_day
+from .engine import (
+    Calibration,
+    ComputeError,
+    Reading,
+    compute_day,
+    compute_day_with_trace,
+    diff_traces,
+)
 from .timeutil import day_bounds, day_to_iso, parse_utc_minute
 
 PROBE_ALIASES = ("probe_id", "probe", "probeid", "sensor_id", "sensor", "探头号")
@@ -334,6 +341,11 @@ def publish_day(probe_id: str, day: int) -> dict:
 
     The whole computation + replacement is one transaction: on failure the
     previous serving (or stale) row stays queryable and no new row is created.
+    The new row stores, next to the payload, the *evidence* — the exact
+    readings, certificates and per-minute results the computation used —
+    so any two versions can later be compared minute by minute. Evidence
+    is written once, inside this transaction, and never rewritten by later
+    imports or certificate changes.
     """
     if not probe_id or not str(probe_id).strip():
         raise ServiceError("探头号不能为空")
@@ -347,11 +359,35 @@ def publish_day(probe_id: str, day: int) -> dict:
                 status_code=404,
             )
         try:
-            payload = compute_day(probe_id, day, readings, calibrations)
+            payload, trace = compute_day_with_trace(
+                probe_id, day, readings, calibrations
+            )
         except ComputeError as exc:
             # Explicit failure path: transaction rolls back, old version kept.
             raise ServiceError(f"重算失败: {exc}", status_code=500) from exc
         payload["data_version"] = version
+
+        # Evidence = the inputs (readings, certificates) and the per-minute
+        # results of THIS computation, all from the same committed snapshot.
+        evidence = {
+            "schema": 1,
+            "probe_id": probe_id,
+            "day": day,
+            "data_version": version,
+            "readings": [
+                {"minute_utc": r.minute, "temperature_c": r.temperature_c}
+                for r in readings
+            ],
+            "certificates": [
+                {
+                    "valid_from": c.valid_from,
+                    "valid_to": c.valid_to,
+                    "offset_c": c.offset_c,
+                }
+                for c in calibrations
+            ],
+            "minutes": trace,
+        }
 
         # Replace the currently served version atomically.
         conn.execute(
@@ -360,9 +396,15 @@ def publish_day(probe_id: str, day: int) -> dict:
             (probe_id, day),
         )
         cur = conn.execute(
-            "INSERT INTO publications(probe_id, day, data_version, status, payload) "
-            "VALUES (?, ?, ?, 'serving', ?)",
-            (probe_id, day, version, json.dumps(payload, ensure_ascii=False)),
+            "INSERT INTO publications(probe_id, day, data_version, status, "
+            "payload, evidence) VALUES (?, ?, ?, 'serving', ?, ?)",
+            (
+                probe_id,
+                day,
+                version,
+                json.dumps(payload, ensure_ascii=False),
+                json.dumps(evidence, ensure_ascii=False),
+            ),
         )
         return {
             "status": "serving",
@@ -428,3 +470,100 @@ def publish_many(probe_id: str | None, day: int | None) -> dict:
             )
     return {"total": len(results), "succeeded": sum(1 for r in results if r["ok"]),
             "failed": sum(1 for r in results if not r["ok"]), "results": results}
+
+
+# --------------------------------------------------------------------------- #
+# Version comparison (difference tracing)
+# --------------------------------------------------------------------------- #
+def _version_meta(row) -> dict:
+    return {
+        "publication_id": row["id"],
+        "status": row["status"],
+        "data_version": row["data_version"],
+        "created_at": row["created_at"],
+        "evidence_available": row["evidence"] is not None,
+    }
+
+
+def compare_publications(
+    probe_id: str, day: int, from_id: int, to_id: int
+) -> dict:
+    """Compare two publication versions of the same probe / UTC day.
+
+    Both rows are fetched in a single read query, so each side reflects one
+    committed state. If either version predates evidence retention (its
+    ``evidence`` is NULL) the comparison is reported as untraceable and the
+    missing basis is *not* reconstructed from current readings/certificates.
+    """
+    if not probe_id or not str(probe_id).strip():
+        raise ServiceError("探头号不能为空")
+    if from_id == to_id:
+        raise ServiceError("请选择两个不同的发布版本进行对比")
+
+    conn = db.connect()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM publications WHERE id IN (?, ?)",
+            (from_id, to_id),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    by_id = {row["id"]: row for row in rows}
+    for pub_id in (from_id, to_id):
+        if pub_id not in by_id:
+            raise ServiceError(f"发布版本 #{pub_id} 不存在", status_code=404)
+    row_from, row_to = by_id[from_id], by_id[to_id]
+    for row in (row_from, row_to):
+        if row["probe_id"] != probe_id or row["day"] != day:
+            raise ServiceError(
+                f"版本 #{row['id']} 属于探头 {row['probe_id']} / "
+                f"{day_to_iso(row['day'])}，与所选 {probe_id} / {day_to_iso(day)} "
+                "不一致；只能对比同探头同 UTC 日的两个版本"
+            )
+
+    result = {
+        "probe_id": probe_id,
+        "day": day,
+        "day_utc": day_to_iso(day),
+        "from": _version_meta(row_from),
+        "to": _version_meta(row_to),
+    }
+
+    missing = [
+        f"#{row['id']}"
+        for row in (row_from, row_to)
+        if row["evidence"] is None
+    ]
+    if missing:
+        # Legacy version without a retained basis: stay queryable, but the
+        # cause of the difference cannot be traced and current values must
+        # not be substituted for the missing historical evidence.
+        result.update(
+            {
+                "traceable": False,
+                "reason": (
+                    f"版本 {'、'.join(missing)} 缺少当时参与计算的依据"
+                    "（该版本发布于差异追溯启用之前），无法追因；"
+                    "为保持证据完整性，不会用当前读数/证书现值填补。"
+                ),
+                "summary": None,
+                "changed_periods": [],
+                "minutes": [],
+            }
+        )
+        return result
+
+    evidence_from = json.loads(row_from["evidence"])
+    evidence_to = json.loads(row_to["evidence"])
+    diff = diff_traces(evidence_from["minutes"], evidence_to["minutes"])
+    result.update(
+        {
+            "traceable": True,
+            "reason": None,
+            "summary": diff["summary"],
+            "changed_periods": diff["changed_periods"],
+            "minutes": diff["minutes"],
+        }
+    )
+    return result

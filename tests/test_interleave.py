@@ -93,13 +93,13 @@ def test_interleaved_steps_single_version_consistency(service_db):
     def boom(*_a, **_kw):
         raise services.ComputeError("injected")
 
-    original = services.compute_day
-    services.compute_day = boom
+    original = services.compute_day_with_trace
+    services.compute_day_with_trace = boom
     try:
         with pytest.raises(services.ServiceError):
             services.publish_day("P-01", DAY_IDX)
     finally:
-        services.compute_day = original
+        services.compute_day_with_trace = original
     assert len(_history_rows()) == 1
     assert _latest()["status"] == "stale"
 

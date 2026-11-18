@@ -56,6 +56,7 @@ CREATE TABLE IF NOT EXISTS publications (
     data_version INTEGER NOT NULL,
     status       TEXT NOT NULL CHECK (status IN ('serving', 'stale', 'superseded')),
     payload      TEXT NOT NULL,
+    evidence     TEXT,
     created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
 CREATE INDEX IF NOT EXISTS idx_pub_lookup
@@ -90,8 +91,22 @@ def init_db() -> None:
     conn = connect()
     try:
         conn.executescript(SCHEMA)
+        _migrate(conn)
     finally:
         conn.close()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Idempotently upgrade databases created by older releases.
+
+    ``publications.evidence`` (the retained per-version computation basis)
+    was added after the initial schema; historical rows keep ``NULL``
+    evidence and stay queryable, but comparisons against them report the
+    difference as untraceable instead of back-filling current values.
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(publications)")}
+    if "evidence" not in cols:
+        conn.execute("ALTER TABLE publications ADD COLUMN evidence TEXT")
 
 
 @contextmanager
